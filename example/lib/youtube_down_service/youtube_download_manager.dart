@@ -72,8 +72,8 @@ class DownloadManagerImpl extends ChangeNotifier implements DownloadManager {
   // 用于检查重复下载的映射：videoId -> SingleTrack
   final Map<String, SingleTrack> _videoIdToTrack = {};
 
-  // yt_dlp 实例
-  final YtDlp _ytDlp = YtDlp(verbose: false);
+  // yt_dlp 实例（已走 Innertube 多客户端 + 跳过网页 SABR formats）
+  final YtDlp _ytDlp = YtDlp(verbose: kDebugMode);
 
   // 存储视频信息：videoId -> VideoInfo
   final Map<String, VideoInfo> _videoInfoCache = {};

@@ -12,6 +12,11 @@ import '../utils/logger.dart';
 import '../utils/iso639_utils.dart';
 import '../utils/retry_manager.dart';
 import 'package:flutter/foundation.dart';
+import 'innertube_clients.dart';
+import 'player_api.dart';
+import 'playability.dart';
+import 'pot_token.dart';
+import 'youtube_cookies.dart';
 
 /// YouTube extractor class
 class YouTubeExtractor {
@@ -19,6 +24,19 @@ class YouTubeExtractor {
   final JscDirector? _jscDirector;
   final int extractorRetries;
   final Duration Function(int attempt)? retrySleepFunction;
+  /// Optional yt-dlp-style PO tokens, e.g. `android_vr.gvs+...`, `web.player+...`.
+  final List<String> poTokenConfigs;
+  /// When false (default), webpage SABR streamingData is ignored like yt-dlp 2026.03+.
+  final bool includeWebpageStreamingData;
+  /// Optional bgutil HTTP base URL. **Must be set explicitly to enable bgutil.**
+  /// Do not assume `127.0.0.1:4416` — phones have no such local server.
+  /// Example desktop: `http://127.0.0.1:4416`
+  /// Example remote: `https://pot.example.com`
+  final String? bgutilBaseUrl;
+  final FetchPotPolicy fetchPotPolicy;
+  final PoTokenDirector _potDirector;
+  /// YouTube account cookies (WebView / Netscape export). Enables login + age-gate paths.
+  final YoutubeCookieJar cookieJar;
   static const String _baseUrl = 'https://www.youtube.com';
   static final Map<String, String> _defaultHeaders = {
     // Use a more recent Chrome User-Agent to avoid bot detection
@@ -39,10 +57,58 @@ class YouTubeExtractor {
   YouTubeExtractor({
     http.Client? client,
     JscDirector? jscDirector,
-    this.extractorRetries = 3,
+    int extractorRetries = 3,
+    Duration Function(int attempt)? retrySleepFunction,
+    List<String> poTokenConfigs = const [],
+    bool includeWebpageStreamingData = false,
+    String? bgutilBaseUrl,
+    FetchPotPolicy fetchPotPolicy = FetchPotPolicy.auto,
+    PoTokenDirector? potDirector,
+    YoutubeCookieJar? cookieJar,
+    Map<String, String>? cookies,
+    String? cookieHeader,
+  }) : this._(
+          client ?? http.Client(),
+          jscDirector,
+          potDirector,
+          extractorRetries,
+          retrySleepFunction,
+          poTokenConfigs,
+          includeWebpageStreamingData,
+          bgutilBaseUrl,
+          fetchPotPolicy,
+          cookieJar ??
+              (cookieHeader != null
+                  ? YoutubeCookieJar.fromHeader(cookieHeader)
+                  : (cookies != null
+                      ? YoutubeCookieJar.fromMap(cookies)
+                      : YoutubeCookieJar.empty())),
+        );
+
+  YouTubeExtractor._(
+    this._client,
+    JscDirector? jscDirector,
+    PoTokenDirector? potDirector,
+    this.extractorRetries,
     this.retrySleepFunction,
-  })  : _client = client ?? http.Client(),
-        _jscDirector = jscDirector ?? (JscDirector().isAvailable() ? JscDirector() : null);
+    this.poTokenConfigs,
+    this.includeWebpageStreamingData,
+    this.bgutilBaseUrl,
+    this.fetchPotPolicy,
+    this.cookieJar,
+  )  : _jscDirector = jscDirector ?? (JscDirector().isAvailable() ? JscDirector() : null),
+        _potDirector = potDirector ??
+            PoTokenDirector.create(
+              httpClient: _client,
+              poTokenConfigs: poTokenConfigs,
+              bgutilBaseUrl: bgutilBaseUrl,
+              policy: fetchPotPolicy,
+            );
+
+  bool get isAuthenticated => cookieJar.isAuthenticated;
+
+  Map<String, String> get _cookieRequestHeaders =>
+      cookieJar.buildRequestHeaders(includeAuth: true);
 
   /// Extract video information from YouTube URL
   Future<VideoInfo> extractInfo(String url) async {
@@ -141,6 +207,11 @@ class YouTubeExtractor {
         final request = http.Request('GET', Uri.parse(watchUrl));
         final headers = Map<String, String>.from(_defaultHeaders);
         headers.addAll(encodingHeaders);
+        // Watch page only needs Cookie (not SAPISIDHASH Authorization).
+        final cookieOnly = cookieJar.toCookieHeader();
+        if (cookieOnly != null) {
+          headers['Cookie'] = cookieOnly;
+        }
         request.headers.addAll(headers);
 
         // Send request and get response
@@ -454,46 +525,61 @@ class YouTubeExtractor {
           'Please try again or check if the video is available.');
     }
 
-    // Check playability status (matching yt-dlp's behavior)
+    // Check playability status. Webpage may report LOGIN_REQUIRED / UNPLAYABLE while
+    // android_vr / visionos player clients still return downloadable formats.
     final playabilityStatus = ytInitialPlayerResponse['playabilityStatus'] as Map?;
-    if (playabilityStatus != null) {
-      final status = playabilityStatus['status'] as String?;
-      final reason = playabilityStatus['reason'] as String?;
-
-      if (status == 'LOGIN_REQUIRED') {
-        debugPrint('⚠️  YouTube requires login or bot verification');
-        debugPrint('Reason: $reason');
-        debugPrint('This usually means YouTube detected automated access.');
-        debugPrint('Solutions:');
-        debugPrint('  1. Use cookies from a logged-in browser session');
-        debugPrint('  2. Try using a different User-Agent');
-        debugPrint('  3. Wait a few minutes and try again');
-        throw Exception('YouTube requires login or bot verification: $reason. '
-            'Please provide cookies or try again later.');
-      } else if (status == 'ERROR') {
-        final errorReason = reason ?? 'Unknown error';
-        debugPrint('⚠️  YouTube returned an error status');
-        debugPrint('Reason: $errorReason');
-        throw Exception('YouTube returned an error: $errorReason');
-      } else if (status != 'OK') {
-        debugPrint('⚠️  Unexpected playability status: $status');
-        if (reason != null) {
-          debugPrint('Reason: $reason');
-        }
-        // Don't throw here, as some statuses might still allow extraction
+    final webpagePlayabilityStatus = playabilityStatus?['status'] as String?;
+    final webpagePlayabilityReason = playabilityStatus?['reason'] as String?;
+    if (webpagePlayabilityStatus != null && webpagePlayabilityStatus != 'OK') {
+      debugPrint(
+        '⚠️  Webpage playability status: $webpagePlayabilityStatus '
+        '(reason: $webpagePlayabilityReason). Continuing with Innertube player clients.',
+      );
+      if (webpagePlayabilityStatus == 'ERROR' &&
+          ytInitialPlayerResponse['videoDetails'] == null) {
+        throw Exception(
+          'YouTube returned an error: ${webpagePlayabilityReason ?? 'Unknown error'}',
+        );
       }
     }
 
     // Parse video details
-    final videoDetails = ytInitialPlayerResponse['videoDetails'] as Map?;
+    Map? videoDetails = ytInitialPlayerResponse['videoDetails'] as Map?;
     final microformat = ytInitialPlayerResponse['microformat']?['playerMicroformatRenderer'] as Map?;
 
+    // Webpage streamingData is often SABR-only (no url / signatureCipher) since ~2025-2026.
+    // Mirror yt-dlp: fetch Innertube player clients (visionos / android_vr / web) and merge.
+    final webpageStreamingData = ytInitialPlayerResponse['streamingData'] as Map?;
+    final resolved = await _resolveStreamingData(
+      videoId: videoId,
+      html: html,
+      webpageStreamingData: webpageStreamingData,
+      webpagePlayerResponse: ytInitialPlayerResponse,
+    );
+    final streamingData = resolved.streamingData;
+    videoDetails ??= resolved.videoDetails;
+
     if (videoDetails == null) {
-      throw Exception('Video details not found');
+      final webpagePlayability = analyzePlayability(ytInitialPlayerResponse);
+      throw YoutubeExtractorException(
+        buildNoFormatsMessage(
+          playability: webpagePlayability.status == 'LOGIN_REQUIRED'
+              ? webpagePlayability
+              : PlayabilityInfo(
+                  status: webpagePlayabilityStatus,
+                  reason: webpagePlayabilityReason ?? 'Video details not found',
+                  kind: webpagePlayabilityStatus == 'LOGIN_REQUIRED'
+                      ? PlayabilityKind.loginRequired
+                      : webpagePlayability.kind,
+                ),
+          isAuthenticated: isAuthenticated,
+          triedWebEmbedded: false,
+        ),
+        playability: webpagePlayability,
+        videoId: videoId,
+      );
     }
 
-    // Extract streaming data
-    final streamingData = ytInitialPlayerResponse['streamingData'] as Map?;
     final formats = <VideoFormat>[];
 
     // Language map for tracking ORIGINAL_LANG_VALUE and DEFAULT_LANG_VALUE
@@ -705,7 +791,10 @@ class YouTubeExtractor {
       formats.clear();
       formats.addAll(updatedFormats);
     } else {
-      debugPrint('Warning: streamingData is null in ytInitialPlayerResponse');
+      debugPrint(
+        'Warning: No usable streamingData from Innertube clients or webpage '
+        '(webpage often returns SABR-only adaptiveFormats without URLs)',
+      );
     }
 
     // Extract captions/subtitles first (needed for language extraction)
@@ -1011,6 +1100,493 @@ class YouTubeExtractor {
       channelIsVerified: channelIsVerified,
       mediaType: 'video',
     );
+  }
+
+  /// Resolve streamingData via Innertube player clients (yt-dlp 2026.x flow).
+  /// Webpage `ytInitialPlayerResponse.streamingData` is no longer trusted by default.
+  Future<({Map<String, dynamic>? streamingData, Map? videoDetails})> _resolveStreamingData({
+    required String videoId,
+    required String html,
+    Map? webpageStreamingData,
+    Map? webpagePlayerResponse,
+  }) async {
+    final session = extractInnertubeSession(html);
+    final authenticated = isAuthenticated;
+
+    // Mobile: jsless first. Logged-in: also try cookie-capable clients.
+    final clientIds = authenticated
+        ? <String>[
+            ...kDefaultJslessPlayerClients,
+            ...kDefaultAuthedPlayerClients,
+          ]
+        : List<String>.from(kDefaultJslessPlayerClients);
+
+    final potEnabled = _potDirector.isConfigured;
+    final sts = await _extractSignatureTimestamp(html);
+    final challenge = potEnabled ? extractBotguardChallenge(html) : null;
+    final cookieHeaders = _cookieRequestHeaders;
+
+    logger.info(
+      'youtube_extractor',
+      'Resolving streamingData via clients=$clientIds '
+      'authenticated=$authenticated '
+      'visitorData=${session.visitorData != null} sts=$sts potEnabled=$potEnabled '
+      'includeWebpage=$includeWebpageStreamingData '
+      'webpageDownloadable=${countDownloadableFormats(webpageStreamingData)}',
+    );
+
+    final playerApi = PlayerApi(_client, extraHeaders: cookieHeaders);
+    var playerResponses = await _fetchClients(
+      playerApi: playerApi,
+      videoId: videoId,
+      clientIds: clientIds,
+      visitorData: session.visitorData,
+      apiKey: session.apiKey,
+      signatureTimestamp: sts,
+      html: html,
+      botguardChallenge: challenge,
+      potEnabled: potEnabled,
+    );
+
+    var merged = mergePlayerStreamingData(
+      playerResponses,
+      webpageStreamingData: webpageStreamingData,
+      clientPriority: [
+        ...clientIds,
+        ...kFallbackPlayerClients,
+        ...kAgeGatePlayerClients,
+      ],
+      includeWebpageStreamingData: includeWebpageStreamingData,
+    );
+
+    // Fallback clients when primary set yields nothing downloadable.
+    if (countDownloadableFormats(merged) == 0) {
+      final fallbackIds =
+          kFallbackPlayerClients.where((id) => !playerResponses.containsKey(id)).toList();
+      if (fallbackIds.isNotEmpty) {
+        logger.info(
+          'youtube_extractor',
+          'Primary clients empty; trying fallbacks=$fallbackIds',
+        );
+        final fallbackResponses = await _fetchClients(
+          playerApi: playerApi,
+          videoId: videoId,
+          clientIds: fallbackIds,
+          visitorData: session.visitorData,
+          apiKey: session.apiKey,
+          signatureTimestamp: sts,
+          html: html,
+          botguardChallenge: challenge,
+          potEnabled: potEnabled,
+        );
+        playerResponses = {...playerResponses, ...fallbackResponses};
+        merged = mergePlayerStreamingData(
+          playerResponses,
+          webpageStreamingData: webpageStreamingData,
+          clientPriority: _clientPriority(clientIds),
+          includeWebpageStreamingData: includeWebpageStreamingData,
+        );
+      }
+    }
+
+    // Made for Kids: android_vr/visionos often UNPLAYABLE → tv_downgraded (yt-dlp).
+    final jslessUnplayable = kDefaultJslessPlayerClients.any((id) {
+      final pr = playerResponses[id];
+      if (pr == null) return true;
+      final status = (pr['playabilityStatus'] as Map?)?['status'] as String?;
+      return status == 'UNPLAYABLE' || status == 'ERROR';
+    });
+    final madeForKids = isMadeForKidsWebpage(html);
+    if (countDownloadableFormats(merged) == 0 &&
+        madeForKids &&
+        jslessUnplayable &&
+        !playerResponses.containsKey('tv_downgraded')) {
+      logger.info(
+        'youtube_extractor',
+        'Made-for-kids + jsless UNPLAYABLE; trying tv_downgraded',
+      );
+      final kidsResponses = await _fetchClients(
+        playerApi: playerApi,
+        videoId: videoId,
+        clientIds: kKidsPlayerClients,
+        visitorData: session.visitorData,
+        apiKey: session.apiKey,
+        signatureTimestamp: sts,
+        html: html,
+        botguardChallenge: challenge,
+        potEnabled: potEnabled,
+      );
+      playerResponses = {...playerResponses, ...kidsResponses};
+      merged = mergePlayerStreamingData(
+        playerResponses,
+        webpageStreamingData: webpageStreamingData,
+        clientPriority: _clientPriority(clientIds),
+        includeWebpageStreamingData: includeWebpageStreamingData,
+      );
+    }
+
+    // Age-gate: append web_embedded like yt-dlp.
+    final playabilities = <PlayabilityInfo>[
+      analyzePlayability(webpagePlayerResponse),
+      ...playerResponses.values.map(analyzePlayability),
+    ];
+    final ageGated = playabilities.any((p) => p.isAgeGated);
+    var triedWebEmbedded = playerResponses.containsKey('web_embedded');
+
+    if (countDownloadableFormats(merged) == 0 && ageGated && !triedWebEmbedded) {
+      logger.info(
+        'youtube_extractor',
+        'Age-restricted detected; trying web_embedded',
+      );
+      if (!authenticated) {
+        logger.warning(
+          'youtube_extractor',
+          'Age-restricted video; some formats may be missing without cookies. '
+          'See $kYoutubeCookieHowtoUrl',
+        );
+      }
+      final ageResponses = await _fetchClients(
+        playerApi: playerApi,
+        videoId: videoId,
+        clientIds: kAgeGatePlayerClients,
+        visitorData: session.visitorData,
+        apiKey: session.apiKey,
+        signatureTimestamp: sts,
+        html: html,
+        botguardChallenge: challenge,
+        potEnabled: potEnabled,
+      );
+      playerResponses = {...playerResponses, ...ageResponses};
+      triedWebEmbedded = true;
+      merged = mergePlayerStreamingData(
+        playerResponses,
+        webpageStreamingData: webpageStreamingData,
+        clientPriority: _clientPriority(clientIds),
+        includeWebpageStreamingData: includeWebpageStreamingData,
+      );
+      playabilities.addAll(ageResponses.values.map(analyzePlayability));
+    }
+
+    // Extra clients when still empty (tv / web_embedded / kids).
+    if (countDownloadableFormats(merged) == 0) {
+      final extraIds = <String>[
+        ...kKidsPlayerClients,
+        ...kAgeGatePlayerClients,
+        'tv',
+      ].where((id) => !playerResponses.containsKey(id)).toList();
+      if (extraIds.isNotEmpty) {
+        logger.info(
+          'youtube_extractor',
+          'Still empty; trying extra clients=$extraIds',
+        );
+        final extraResponses = await _fetchClients(
+          playerApi: playerApi,
+          videoId: videoId,
+          clientIds: extraIds,
+          visitorData: session.visitorData,
+          apiKey: session.apiKey,
+          signatureTimestamp: sts,
+          html: html,
+          botguardChallenge: challenge,
+          potEnabled: potEnabled,
+        );
+        playerResponses = {...playerResponses, ...extraResponses};
+        if (extraResponses.containsKey('web_embedded')) {
+          triedWebEmbedded = true;
+        }
+        merged = mergePlayerStreamingData(
+          playerResponses,
+          webpageStreamingData: webpageStreamingData,
+          clientPriority: _clientPriority(clientIds),
+          includeWebpageStreamingData: includeWebpageStreamingData,
+        );
+        playabilities.addAll(extraResponses.values.map(analyzePlayability));
+      }
+    }
+
+    // WEB player API last among clients (yt-dlp includes web when JS is available).
+    // Formats often need ejs n/sig; SABR-only responses yield 0 downloadable and we continue.
+    if (countDownloadableFormats(merged) == 0 &&
+        !playerResponses.containsKey('web') &&
+        _jscDirector != null &&
+        _jscDirector!.isAvailable()) {
+      logger.info(
+        'youtube_extractor',
+        'Still empty; trying web player API (needs ejs for n/sig)',
+      );
+      final webResponses = await _fetchClients(
+        playerApi: playerApi,
+        videoId: videoId,
+        clientIds: kWebPlayerClients,
+        visitorData: session.visitorData,
+        apiKey: session.apiKey,
+        signatureTimestamp: sts,
+        html: html,
+        botguardChallenge: challenge,
+        potEnabled: potEnabled,
+      );
+      playerResponses = {...playerResponses, ...webResponses};
+      merged = mergePlayerStreamingData(
+        playerResponses,
+        webpageStreamingData: webpageStreamingData,
+        clientPriority: _clientPriority(clientIds),
+        includeWebpageStreamingData: includeWebpageStreamingData,
+      );
+      playabilities.addAll(webResponses.values.map(analyzePlayability));
+    }
+
+    // Last resort: webpage had real url/signatureCipher formats (not SABR stubs).
+    final webpageDl = countDownloadableFormats(webpageStreamingData);
+    if (countDownloadableFormats(merged) == 0 &&
+        webpageDl > 0 &&
+        !includeWebpageStreamingData) {
+      logger.info(
+        'youtube_extractor',
+        'Clients empty; falling back to $webpageDl downloadable webpage format(s)',
+      );
+      merged = mergePlayerStreamingData(
+        playerResponses,
+        webpageStreamingData: webpageStreamingData,
+        clientPriority: _clientPriority(clientIds),
+        includeWebpageStreamingData: true,
+      );
+    }
+
+    if (potEnabled) {
+      merged = await _attachGvsPoTokens(
+        merged,
+        videoId: videoId,
+        visitorData: session.visitorData,
+        html: html,
+        botguardChallenge: challenge,
+      );
+    }
+
+    Map? apiVideoDetails;
+    for (final clientId in _clientPriority(clientIds)) {
+      final details = playerResponses[clientId]?['videoDetails'] as Map?;
+      if (details != null && details['videoId'] == videoId) {
+        apiVideoDetails = details;
+        break;
+      }
+    }
+    if (apiVideoDetails == null) {
+      for (final pr in playerResponses.values) {
+        final details = pr['videoDetails'] as Map?;
+        if (details != null && details['videoId'] == videoId) {
+          apiVideoDetails = details;
+          break;
+        }
+      }
+    }
+
+    final downloadable = countDownloadableFormats(merged);
+    logger.info(
+      'youtube_extractor',
+      'Merged streamingData: clients=${playerResponses.keys.toList()} '
+      'downloadableFormats=$downloadable '
+      'adaptive=${(merged?['adaptiveFormats'] as List?)?.length ?? 0} '
+      'progressive=${(merged?['formats'] as List?)?.length ?? 0}',
+    );
+
+    if (downloadable == 0) {
+      final drm = playerResponsesHaveDrm(playerResponses.values) ||
+          streamingDataHasDrm(webpageStreamingData) ||
+          streamingDataHasDrm(merged);
+      final primary = drm
+          ? const PlayabilityInfo(
+              status: 'UNPLAYABLE',
+              reason: 'This video is DRM protected',
+              kind: PlayabilityKind.drmProtected,
+            )
+          : selectPrimaryPlayability(playabilities);
+      throw YoutubeExtractorException(
+        buildNoFormatsMessage(
+          playability: primary,
+          isAuthenticated: authenticated,
+          triedWebEmbedded: triedWebEmbedded,
+        ),
+        playability: primary,
+        videoId: videoId,
+      );
+    }
+
+    return (streamingData: merged, videoDetails: apiVideoDetails);
+  }
+
+  /// Stable merge / lookup order aligned with yt-dlp client priority.
+  List<String> _clientPriority(List<String> primary) => [
+        ...primary,
+        ...kFallbackPlayerClients,
+        ...kKidsPlayerClients,
+        ...kAgeGatePlayerClients,
+        'tv',
+        ...kWebPlayerClients,
+      ];
+
+  Future<Map<String, Map<String, dynamic>>> _fetchClients({
+    required PlayerApi playerApi,
+    required String videoId,
+    required List<String> clientIds,
+    String? visitorData,
+    String? apiKey,
+    String? signatureTimestamp,
+    required String html,
+    String? botguardChallenge,
+    required bool potEnabled,
+  }) async {
+    final playerPoTokens = <String, String?>{};
+    if (potEnabled) {
+      for (final id in clientIds) {
+        // Only request player POT when a real token source is configured.
+        if (!isWebPoClient(id) &&
+            lookupConfiguredPoToken(
+                  parsePoTokenConfigs(poTokenConfigs),
+                  client: id,
+                  context: PoTokenContext.player,
+                ) ==
+                null) {
+          continue;
+        }
+        playerPoTokens[id] = await _potDirector.getPoToken(
+          PoTokenRequest(
+            context: PoTokenContext.player,
+            internalClientName: id,
+            visitorData: visitorData,
+            videoId: videoId,
+            videoWebpage: html,
+            innertubeContext: {
+              'client': {
+                'clientName': innertubeClientNameFor(id),
+                if (visitorData != null) 'visitorData': visitorData,
+              },
+            },
+            botguardChallenge: botguardChallenge,
+          ),
+          required: false,
+        );
+      }
+    }
+
+    return playerApi.fetchPlayerResponses(
+      videoId: videoId,
+      clientIds: clientIds,
+      visitorData: visitorData,
+      apiKey: apiKey,
+      signatureTimestamp: signatureTimestamp,
+      playerPoTokens: playerPoTokens,
+    );
+  }
+
+  Future<Map<String, dynamic>?> _attachGvsPoTokens(
+    Map<String, dynamic>? streamingData, {
+    required String videoId,
+    String? visitorData,
+    required String html,
+    String? botguardChallenge,
+  }) async {
+    if (streamingData == null) return null;
+    final result = Map<String, dynamic>.from(streamingData);
+    final gvsCache = <String, String?>{};
+
+    Future<String?> gvsFor(String clientId) async {
+      if (gvsCache.containsKey(clientId)) return gvsCache[clientId];
+
+      // Non-WebPO clients need platform attestation; only use configured tokens.
+      if (!isWebPoClient(clientId)) {
+        final configured = lookupConfiguredPoToken(
+          parsePoTokenConfigs(poTokenConfigs),
+          client: clientId,
+          context: PoTokenContext.gvs,
+        );
+        gvsCache[clientId] = configured;
+        return configured;
+      }
+
+      final token = await _potDirector.getPoToken(
+        PoTokenRequest(
+          context: PoTokenContext.gvs,
+          internalClientName: clientId,
+          visitorData: visitorData,
+          videoId: videoId,
+          videoWebpage: html,
+          innertubeContext: {
+            'client': {
+              'clientName': innertubeClientNameFor(clientId),
+              if (visitorData != null) 'visitorData': visitorData,
+            },
+          },
+          botguardChallenge: botguardChallenge,
+        ),
+        required: true,
+      );
+      gvsCache[clientId] = token;
+      return token;
+    }
+
+    Future<List> rewriteList(List? list) async {
+      if (list == null) return const [];
+      final out = <dynamic>[];
+      for (final raw in list) {
+        if (raw is! Map) {
+          out.add(raw);
+          continue;
+        }
+        final format = Map<String, dynamic>.from(raw);
+        final clientId = format['_yt_dlp_client']?.toString() ?? 'web';
+        final gvsPot = await gvsFor(clientId);
+        final url = format['url'];
+        if (gvsPot != null && url is String && url.isNotEmpty) {
+          format['url'] = appendPotQuery(url, gvsPot);
+        }
+        out.add(format);
+      }
+      return out;
+    }
+
+    if (result['adaptiveFormats'] is List) {
+      result['adaptiveFormats'] = await rewriteList(result['adaptiveFormats'] as List);
+    }
+    if (result['formats'] is List) {
+      result['formats'] = await rewriteList(result['formats'] as List);
+    }
+    return result;
+  }
+
+  /// Extract signatureTimestamp (sts) from ytcfg / player JS, mirroring yt-dlp.
+  Future<String?> _extractSignatureTimestamp(String html) async {
+    final stsFromHtml = RegExp(r'(?:signatureTimestamp|sts)\s*[:=]\s*([0-9]{5})')
+        .firstMatch(html)
+        ?.group(1);
+    if (stsFromHtml != null) {
+      logger.info('youtube_extractor', 'Found sts in webpage/ytcfg: $stsFromHtml');
+      return stsFromHtml;
+    }
+
+    final playerUrl = _extractPlayerUrl(html);
+    if (playerUrl == null) return null;
+
+    try {
+      final response = await _client
+          .get(Uri.parse(playerUrl), headers: {
+            'User-Agent': _defaultHeaders['User-Agent']!,
+            'Accept': '*/*',
+            'Referer': 'https://www.youtube.com/',
+          })
+          .timeout(const Duration(seconds: 20));
+      if (response.statusCode != 200) return null;
+      final code = utf8.decode(response.bodyBytes, allowMalformed: true);
+      final sts = RegExp(r'(?:signatureTimestamp|sts)\s*[:=]\s*([0-9]{5})')
+          .firstMatch(code)
+          ?.group(1);
+      if (sts != null) {
+        logger.info('youtube_extractor', 'Found sts in player JS: $sts');
+      }
+      return sts;
+    } catch (e) {
+      logger.warning('youtube_extractor', 'Failed to extract sts from player JS: $e');
+      return null;
+    }
   }
 
   /// Safe integer conversion helper

@@ -5,6 +5,8 @@ import 'dart:io';
 import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as path;
 import 'extractor/youtube_extractor.dart';
+import 'extractor/pot_token.dart';
+import 'extractor/youtube_cookies.dart';
 import 'downloader/http_downloader.dart';
 import 'models/video_info.dart';
 import 'utils/format_selector.dart';
@@ -30,8 +32,29 @@ class YtDlp {
     bool verbose = false,
     LogLevel? logLevel,
     LogHandler? logHandler,
+    /// Optional yt-dlp-style PO tokens (`CLIENT.CONTEXT+TOKEN`).
+    /// Mobile apps normally leave this empty.
+    List<String> poTokenConfigs = const [],
+    bool includeWebpageStreamingData = false,
+    /// Optional remote/desktop bgutil URL. Leave null on mobile.
+    String? bgutilBaseUrl,
+    FetchPotPolicy fetchPotPolicy = FetchPotPolicy.auto,
+    /// YouTube cookies map (`LOGIN_INFO`, `SAPISID`, …) from WebView / export.
+    Map<String, String>? cookies,
+    /// Alternative to [cookies]: raw `Cookie` header string.
+    String? cookieHeader,
+    YoutubeCookieJar? cookieJar,
   })  : _options = options ?? {},
-        _extractor = YouTubeExtractor(client: httpClient),
+        _extractor = YouTubeExtractor(
+          client: httpClient,
+          poTokenConfigs: poTokenConfigs,
+          includeWebpageStreamingData: includeWebpageStreamingData,
+          bgutilBaseUrl: bgutilBaseUrl,
+          fetchPotPolicy: fetchPotPolicy,
+          cookies: cookies,
+          cookieHeader: cookieHeader,
+          cookieJar: cookieJar,
+        ),
         _downloader = HttpDownloader(
           client: httpClient,
           options: DownloadOptions(verbose: verbose),
@@ -52,6 +75,25 @@ class YtDlp {
   Future<VideoInfo> extractInfo(String url) async {
     return await _extractor.extractInfo(url);
   }
+
+  /// Cookie jar used for watch-page + Innertube (mutable; update after WebView login).
+  YoutubeCookieJar get cookieJar => _extractor.cookieJar;
+
+  /// Whether LOGIN_INFO + SAPISID family cookies are present.
+  bool get isAuthenticated => _extractor.isAuthenticated;
+
+  /// Replace YouTube cookies (from WebView / export).
+  void setCookies(Map<String, String> cookies) {
+    _extractor.cookieJar.replaceAll(cookies);
+  }
+
+  /// Set cookies from a raw `Cookie` header string.
+  void setCookieHeader(String header) {
+    _extractor.cookieJar.replaceAll(YoutubeCookieJar.fromHeader(header).asMap);
+  }
+
+  /// Clear YouTube cookies.
+  void clearCookies() => _extractor.cookieJar.clear();
 
   /// Download a specific VideoFormat directly without extracting video info again
   /// This is useful when you already have a VideoFormat object from a previous extractInfo call

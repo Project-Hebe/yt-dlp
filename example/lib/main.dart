@@ -57,7 +57,7 @@ class ExampleHomePage extends ConsumerStatefulWidget {
 
 class _ExampleHomePageState extends ConsumerState<ExampleHomePage> {
   static const _defaultUrl =
-      'https://www.youtube.com/watch?v=jNQXAC9IVRw';
+      'https://www.youtube.com/watch?v=lE5FIV-76x0';
 
   final _urlController = TextEditingController(text: _defaultUrl);
   final _langController = TextEditingController();
